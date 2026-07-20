@@ -24,27 +24,132 @@ from this repo's `scripts/` instead and point `docker-compose.yaml` at it.
 
 ## Prerequisites
 
-You need your own PKI already set up:
+You need your own PKI already set up, plus a Microsoft Entra ID app
+registration. This stack doesn't issue certificates or provision that app
+for you — see the two sections below for both.
 
-- A CA (or chain) that issues client certificates carrying:
-  - `TLS Web Client Authentication` EKU
-  - a SAN URI under your `URN_PREFIX`, e.g. `urn:example.com:entra-device-id:<entra device id>`
-- A server certificate/key for FreeRADIUS itself, signed by (or chaining to) that CA
-- A Microsoft Entra ID app registration with Graph permissions to read
-  `DeviceManagementManagedDevices.Read.All` and `User.Read.All`
+## PKI setup
 
-This stack does not issue certificates or provision the Entra app for you.
+If you don't already have a CA, use
+[pimptune-stack](https://github.com/griefersutherland/pimptune-stack) — it
+stands up a real root CA, intermediate CA, and a running
+[`step-ca`](https://smallstep.com/docs/step-ca/) instance, wired to Intune
+SCEP enrollment via [PIMPtune](https://github.com/griefersutherland/pimptune).
+Deploy and configure it per its own README first (its "Going to production"
+section covers generating the root offline, which you want for anything
+beyond a POC). Everything below assumes it's up and its `./info/` directory
+is populated (`root_ca.crt`, `intermediate_ca.crt`, `intermediate_ca.key`,
+`intermediate_ca.txt`).
+
+### 1. Copy the CA chain
+
+```bash
+cat pimptune-stack/info/intermediate_ca.crt pimptune-stack/info/root_ca.crt \
+  > intune-radius-stack/certs/ca-chain.pem
+```
+
+`EXPECTED_ISSUER_CN` in `.env` must match the intermediate's CN — check with
+`step certificate inspect pimptune-stack/info/intermediate_ca.crt | grep Subject:`.
+
+### 2. Request the FreeRADIUS server certificate
+
+FreeRADIUS's own TLS identity isn't something SCEP/Intune issues — it's a
+server cert you request directly from the intermediate, the same way
+pimptune-stack's own README mints its SCEP RA cert:
+
+```bash
+cd pimptune-stack
+step certificate create "radius.yourdomain.internal" \
+  ../intune-radius-stack/certs/radius-server.crt \
+  ../intune-radius-stack/certs/radius-server.key \
+  --profile leaf --kty RSA --size 2048 \
+  --ca ./info/intermediate_ca.crt --ca-key ./info/intermediate_ca.key \
+  --ca-password-file ./info/intermediate_ca.txt \
+  --san radius.yourdomain.internal \
+  --not-after 8760h --no-password --insecure
+
+cat intune-radius-stack/certs/radius-server.crt ./info/intermediate_ca.crt \
+  > ../intune-radius-stack/certs/radius-server-chain.pem
+```
+
+(`--no-password --insecure` leaves the key unencrypted on disk, matching
+what `start-radius.sh` expects — it doesn't prompt for a private key
+password. Keep the file permissions tight instead.)
+
+### 3. Client certs (device/user) via Intune SCEP
+
+Once pimptune-stack's Intune configuration profiles are assigned (its
+README walks through the Trusted Certificate + SCEP profiles), devices
+enroll automatically. The one thing to add on top of pimptune-stack's own
+instructions: in the SCEP profile's **Subject Alternative Name** section,
+add a **URI** entry so `verify-client-cert.sh` has something to check:
+
+| Type | Value |
+|---|---|
+| URI | `urn:example.com:entra-device-id:{{AAD_Device_ID}}` |
+
+— using your actual `URN_PREFIX` in place of `urn:example.com`. This is
+independent of pimptune's own optional CN-based compliance check; our
+helper reads identity from this SAN URI, not the Subject CN.
+
+### 4. Requesting a one-off client cert manually (no Intune)
+
+For testing, or non-Intune clients, mint one directly the same way as the
+server cert, adding the SAN URI by hand:
+
+```bash
+step certificate create "test-device" test-device.crt test-device.key \
+  --profile leaf --kty RSA --size 2048 \
+  --ca ./info/intermediate_ca.crt --ca-key ./info/intermediate_ca.key \
+  --ca-password-file ./info/intermediate_ca.txt \
+  --san "urn:example.com:entra-device-id:<entra device id>" \
+  --not-after 720h --no-password --insecure
+```
+
+`step certificate create`'s default `leaf` profile (used above) normally
+includes both `serverAuth` and `clientAuth` in Extended Key Usage — verify
+it actually landed with `openssl x509 -in test-device.crt -noout -text |
+grep -A2 "Extended Key Usage"`. If it's missing `TLS Web Client
+Authentication`, you'll need a [custom step-ca
+template](https://smallstep.com/docs/step-ca/templates/) rather than a CLI
+flag to force it.
+
+## Microsoft Entra ID app registration
+
+`intune-radius-helper` needs its own app registration (separate from
+pimptune's, if you're also using pimptune-stack — different app, different
+permissions):
+
+1. **Azure Portal → Microsoft Entra ID → App registrations → New registration.**
+   Name it (e.g. `intune-radius-helper`), leave account type as the
+   default single-tenant, click **Register**.
+2. On the app's **Overview** page, note the **Application (client) ID** and
+   **Directory (tenant) ID** — these go in `.env` as `CLIENT_ID` and
+   `TENANT_ID`.
+3. **Certificates & secrets → Client secrets → New client secret.** Set a
+   description and expiry, then copy the **Value** column immediately (not
+   the Secret ID) — it's only shown once. This goes in `.env` as
+   `CLIENT_SECRET`.
+4. **API permissions → Add a permission → Microsoft Graph → Application
+   permissions**, and add all three:
+   - `DeviceManagementManagedDevices.Read.All`
+   - `Device.Read.All`
+   - `User.Read.All`
+5. Click **Grant admin consent for `<your tenant>`** (requires Global
+   Administrator or Privileged Role Administrator). Permissions won't take
+   effect without this step, regardless of what's listed.
 
 ## Setup
 
 ```
 cp .env.example .env
-# fill in TENANT_ID / CLIENT_ID / CLIENT_SECRET, RADIUS_SHARED_SECRET,
-# EXPECTED_ISSUER_CN, POSTGRES_PASSWORD, REDIS_PASSWORD, etc.
+# fill in TENANT_ID / CLIENT_ID / CLIENT_SECRET (from the app registration above),
+# RADIUS_SHARED_SECRET, RADIUS_CLIENT_IPADDRS, EXPECTED_ISSUER_CN,
+# POSTGRES_PASSWORD, REDIS_PASSWORD, etc.
 
-mkdir -p certs logs data
-# place ca-chain.pem, radius-server.key, radius-server-chain.pem (and a CRL
-# if ENABLE_CRL_VERIFICATION=true) into ./certs
+mkdir -p certs logs
+# place ca-chain.pem, radius-server.key, radius-server-chain.pem from the
+# PKI setup above (and a CRL if ENABLE_CRL_VERIFICATION=true) into ./certs
 
 docker compose up -d
 ```
@@ -52,6 +157,37 @@ docker compose up -d
 `docker compose logs -f freeradius` and `docker compose logs -f intune-radius-helper`
 are your main debugging entry points; `curl http://localhost:8080/healthz`
 from inside the `intune-radius-helper` container reports cache/backend health.
+
+### Smoke test before pointing real infra at it
+
+Verify the whole chain — cert parsing, Graph auth, and the compliance
+decision — without needing a real 802.1X supplicant:
+
+```bash
+# any client cert issued per the PKI setup above works, including a
+# manually-minted one-off test cert
+docker compose cp path/to/test-device.crt freeradius:/tmp/test-device.crt
+docker compose exec freeradius /usr/local/bin/verify-client-cert.sh \
+  /tmp/test-device.crt testuser aa:bb:cc:dd:ee:ff
+echo "exit: $?"
+docker compose exec freeradius tail -5 /logs/radius-verify.log
+```
+
+Exit `0` / `PASS` means the full pipeline (chain verify → issuer CN → EKU →
+SAN URI → live Graph device lookup → compliance policy) works end to end.
+A `403`/`FAIL` from the helper with a real Graph error message (not an auth
+error) usually means the device genuinely isn't compliant or isn't
+enrolled — check `docker compose logs intune-radius-helper` for the exact
+reason.
+
+### RADIUS clients (APs / switches)
+
+Point your access points or switches' RADIUS configuration at this host on
+UDP `1812` (auth) and `1813` (accounting), using `RADIUS_SHARED_SECRET` from
+`.env`. Each AP/switch's source IP must fall inside `RADIUS_CLIENT_IPADDRS`
+(comma-separated CIDRs/IPs) or FreeRADIUS will silently drop its requests —
+check `docker compose logs freeradius` for `Ignoring request... unknown
+client` if auth attempts don't show up at all.
 
 ## Updating
 
