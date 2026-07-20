@@ -50,6 +50,7 @@ services:
     volumes:
       - ./logs:/logs
       - ./data/helper:/data
+      - ./config:/config:ro
     networks:
       - internal
 

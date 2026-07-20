@@ -1,5 +1,7 @@
 # intune-radius-stack
 
+> **Note:** This project is written by Claude (Anthropic) and is still a work in progress. Review it accordingly before relying on it.
+
 A docker-compose stack wiring together EAP-TLS FreeRADIUS with a Microsoft
 Intune/Entra device-compliance gate, backed by Postgres + Redis caching.
 
@@ -92,6 +94,18 @@ add a **URI** entry so `verify-client-cert.sh` has something to check:
 independent of pimptune's own optional CN-based compliance check; our
 helper reads identity from this SAN URI, not the Subject CN.
 
+If you also want the helper's optional AD/LDAP device lookup
+(`AD_LDAP_ENABLED`, see `.env.example`), add a second URI entry in the same
+section:
+
+| Type | Value |
+|---|---|
+| URI | `urn:example.com:onprem-sid:{{OnPremisesSecurityIdentifier}}` |
+
+This is Intune's strong-certificate-mapping SID variable for hybrid-joined
+devices - it resolves to nothing (and the URI is simply absent from the
+issued cert) for devices with no on-prem AD counterpart.
+
 ### 4. Requesting a one-off client cert manually (no Intune)
 
 For testing, or non-Intune clients, mint one directly the same way as the
@@ -150,9 +164,13 @@ permissions):
 # then fill in by hand: TENANT_ID / CLIENT_ID / CLIENT_SECRET (from the app
 # registration above), RADIUS_CLIENT_IPADDRS, EXPECTED_ISSUER_CN, URN_PREFIX
 
-mkdir -p certs logs
+mkdir -p certs logs config
 # place ca-chain.pem, radius-server.key, radius-server-chain.pem from the
 # PKI setup above (and a CRL if ENABLE_CRL_VERIFICATION=true) into ./certs
+
+# optional: copy intune-radius-helper's policy.example.json to
+# ./config/policy.json and edit it to customize access/untrust/reject rules -
+# if you skip this, the helper's built-in default ruleset is used
 
 docker compose up -d
 ```

@@ -22,8 +22,42 @@ RADIUS_CLIENT_NAME_RAW="${RADIUS_CLIENT_NAME:-wifi_infra}"
 RADIUS_CLIENT_NAME="$(printf '%s' "$RADIUS_CLIENT_NAME_RAW" | sed 's/[^A-Za-z0-9_]/_/g')"
 
 RADIUS_CLIENT_IPADDRS="${RADIUS_CLIENT_IPADDRS:-${RADIUS_CLIENT_IPADDR:-}}"
-RADIUS_VLAN_ID="${RADIUS_VLAN_ID:-10}"
 FREERADIUS_DEBUG="${FREERADIUS_DEBUG:-true}"
+
+is_true() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    true|yes|1|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_vlan_tag() {
+  # $1 = env var name (for error messages), $2 = tag value
+  case "$2" in
+    ''|*[!0-9]*)
+      echo "ERROR: ${1} must be a numeric VLAN ID (1-4094) when its VLAN is enabled, got '${2}'"
+      exit 1
+      ;;
+  esac
+  if [ "$2" -lt 1 ] || [ "$2" -gt 4094 ]; then
+    echo "ERROR: ${1}=${2} is out of the valid VLAN ID range (1-4094)"
+    exit 1
+  fi
+}
+
+WIFI_ACCESS_VLAN_ENABLED="${WIFI_ACCESS_VLAN_ENABLED:-false}"
+WIFI_ACCESS_VLAN_TAG="${WIFI_ACCESS_VLAN_TAG:-}"
+WIFI_UNTRUST_VLAN_ENABLED="${WIFI_UNTRUST_VLAN_ENABLED:-false}"
+WIFI_UNTRUST_VLAN_TAG="${WIFI_UNTRUST_VLAN_TAG:-}"
+WIRED_ACCESS_VLAN_ENABLED="${WIRED_ACCESS_VLAN_ENABLED:-false}"
+WIRED_ACCESS_VLAN_TAG="${WIRED_ACCESS_VLAN_TAG:-}"
+WIRED_UNTRUST_VLAN_ENABLED="${WIRED_UNTRUST_VLAN_ENABLED:-false}"
+WIRED_UNTRUST_VLAN_TAG="${WIRED_UNTRUST_VLAN_TAG:-}"
+
+is_true "$WIFI_ACCESS_VLAN_ENABLED" && validate_vlan_tag WIFI_ACCESS_VLAN_TAG "$WIFI_ACCESS_VLAN_TAG"
+is_true "$WIFI_UNTRUST_VLAN_ENABLED" && validate_vlan_tag WIFI_UNTRUST_VLAN_TAG "$WIFI_UNTRUST_VLAN_TAG"
+is_true "$WIRED_ACCESS_VLAN_ENABLED" && validate_vlan_tag WIRED_ACCESS_VLAN_TAG "$WIRED_ACCESS_VLAN_TAG"
+is_true "$WIRED_UNTRUST_VLAN_ENABLED" && validate_vlan_tag WIRED_UNTRUST_VLAN_TAG "$WIRED_UNTRUST_VLAN_TAG"
 
 if [ -z "$RADIUS_CLIENT_IPADDRS" ]; then
   echo "ERROR: RADIUS_CLIENT_IPADDRS or RADIUS_CLIENT_IPADDR is required"
@@ -117,15 +151,41 @@ ${CRL_BLOCK}
 }
 EAP_EOF
 
-if [ -n "$RADIUS_VLAN_ID" ] && [ "$RADIUS_VLAN_ID" != "none" ] && [ "$RADIUS_VLAN_ID" != "false" ]; then
-  POST_AUTH_BLOCK='
-    post-auth {
-        update reply {
-            Tunnel-Type = VLAN
-            Tunnel-Medium-Type = IEEE-802
-            Tunnel-Private-Group-Id = "'"$RADIUS_VLAN_ID"'"
-        }
-    }'
+# Medium (wifi vs wired) is read from NAS-Port-Type, which the AP/switch must
+# actually send. Only "Access" is wired into a live branch below - the
+# helper's allow/deny is the only signal available today, and reaching
+# post-auth already means the helper allowed this session. "Untrust" tags are
+# validated above (so bad config still fails fast) but deliberately have no
+# branch here; they're scaffolding for a future policy-engine signal that
+# doesn't exist yet.
+VLAN_BRANCHES=""
+
+if is_true "$WIFI_ACCESS_VLAN_ENABLED"; then
+  VLAN_BRANCHES="${VLAN_BRANCHES}
+        if (&NAS-Port-Type == \"Wireless-802.11\") {
+            update reply {
+                Tunnel-Type = VLAN
+                Tunnel-Medium-Type = IEEE-802
+                Tunnel-Private-Group-Id = \"${WIFI_ACCESS_VLAN_TAG}\"
+            }
+        }"
+fi
+
+if is_true "$WIRED_ACCESS_VLAN_ENABLED"; then
+  VLAN_BRANCHES="${VLAN_BRANCHES}
+        if (&NAS-Port-Type == \"Ethernet\") {
+            update reply {
+                Tunnel-Type = VLAN
+                Tunnel-Medium-Type = IEEE-802
+                Tunnel-Private-Group-Id = \"${WIRED_ACCESS_VLAN_TAG}\"
+            }
+        }"
+fi
+
+if [ -n "$VLAN_BRANCHES" ]; then
+  POST_AUTH_BLOCK="
+    post-auth {${VLAN_BRANCHES}
+    }"
 else
   POST_AUTH_BLOCK='
     post-auth {
@@ -179,6 +239,25 @@ grep -nE "tmpdir|check_crl|ca_path|require_client_cert|private_key_file|certific
 echo
 echo "Generated site VLAN config:"
 grep -nA8 -B2 "Tunnel-Private-Group-Id\|post-auth" /etc/freeradius/sites-enabled/default || true
+
+echo
+echo "VLAN policy (Untrust tiers are validated but not yet assigned - pending policy-engine integration):"
+for _vlan_summary in \
+  "wifi_access:${WIFI_ACCESS_VLAN_ENABLED}:${WIFI_ACCESS_VLAN_TAG}" \
+  "wifi_untrust:${WIFI_UNTRUST_VLAN_ENABLED}:${WIFI_UNTRUST_VLAN_TAG}" \
+  "wired_access:${WIRED_ACCESS_VLAN_ENABLED}:${WIRED_ACCESS_VLAN_TAG}" \
+  "wired_untrust:${WIRED_UNTRUST_VLAN_ENABLED}:${WIRED_UNTRUST_VLAN_TAG}"
+do
+  _name="${_vlan_summary%%:*}"
+  _rest="${_vlan_summary#*:}"
+  _enabled="${_rest%%:*}"
+  _tag="${_rest#*:}"
+  if is_true "$_enabled"; then
+    echo "  ${_name}: enabled, tag=${_tag}"
+  else
+    echo "  ${_name}: disabled"
+  fi
+done
 
 echo
 echo "FREERADIUS_DEBUG=${FREERADIUS_DEBUG}"
