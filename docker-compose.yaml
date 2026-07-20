@@ -1,0 +1,74 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - internal
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: >
+      sh -c 'redis-server
+      --appendonly yes
+      --requirepass "$${REDIS_PASSWORD}"'
+    volumes:
+      - ./data/redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - internal
+
+  intune-radius-helper:
+    image: ghcr.io/griefersutherland/intune-radius-helper:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./logs:/logs
+      - ./data/helper:/data
+    networks:
+      - internal
+
+  freeradius:
+    image: ghcr.io/griefersutherland/freeradius-wifi-eap-tls:latest
+    restart: unless-stopped
+    command: ["/usr/local/bin/start-radius.sh"]
+    env_file:
+      - .env
+    depends_on:
+      - intune-radius-helper
+    ports:
+      - "1812:1812/udp"
+      - "1813:1813/udp"
+    volumes:
+      - ./certs:/etc/freeradius/certs:ro
+      - ./logs:/logs
+    networks:
+      - internal
+
+networks:
+  internal:
