@@ -142,10 +142,13 @@ permissions):
 ## Setup
 
 ```
-cp .env.example .env
-# fill in TENANT_ID / CLIENT_ID / CLIENT_SECRET (from the app registration above),
-# RADIUS_SHARED_SECRET, RADIUS_CLIENT_IPADDRS, EXPECTED_ISSUER_CN,
-# POSTGRES_PASSWORD, REDIS_PASSWORD, etc.
+./scripts/generate-secrets.sh
+# creates .env from .env.example and fills in random
+# POSTGRES_PASSWORD / REDIS_PASSWORD / RADIUS_SHARED_SECRET
+# (--force to regenerate ones that are already set)
+
+# then fill in by hand: TENANT_ID / CLIENT_ID / CLIENT_SECRET (from the app
+# registration above), RADIUS_CLIENT_IPADDRS, EXPECTED_ISSUER_CN, URN_PREFIX
 
 mkdir -p certs logs
 # place ca-chain.pem, radius-server.key, radius-server-chain.pem from the
