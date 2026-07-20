@@ -1,16 +1,26 @@
 # intune-radius-stack
 
 A docker-compose stack wiring together EAP-TLS FreeRADIUS with a Microsoft
-Intune/Entra device-compliance gate, backed by Postgres + Redis caching. It
-pulls two pre-built images:
+Intune/Entra device-compliance gate, backed by Postgres + Redis caching.
 
-- [freeradius-wifi-eap-tls](https://github.com/griefersutherland/freeradius-wifi-eap-tls) — FreeRADIUS, config generated from env vars
-- [intune-radius-helper](https://github.com/griefersutherland/intune-radius-helper) — FastAPI service that checks client cert identity against Intune/Entra via Microsoft Graph
+- **freeradius** — the stock [`freeradius/freeradius-server`](https://hub.docker.com/r/freeradius/freeradius-server) image, unmodified. `scripts/start-radius.sh` and `scripts/verify-client-cert.sh` (GPLv3, in this repo) are bind-mounted in and installed as the container's entrypoint — no custom image to build or publish.
+- [intune-radius-helper](https://github.com/griefersutherland/intune-radius-helper) — pre-built image; FastAPI service that checks client cert identity against Intune/Entra via Microsoft Graph
 
 FreeRADIUS calls the helper over HTTP (`http://intune-radius-helper:8080/check`)
 during the TLS handshake's certificate verify step; the helper looks up the
 device/user identity embedded in the cert's SAN URIs against Microsoft Graph
 (cached in Postgres, hot-cached in Redis) and allows or denies the auth.
+
+`start-radius.sh` generates FreeRADIUS's `clients.conf`, EAP-TLS config, and
+site config from env vars at container start; `verify-client-cert.sh` runs
+per-auth as the EAP-TLS `verify { client = ... }` hook — checks the cert
+chain, issuer CN, EKU, and SAN URI, then calls the helper. Because the
+freeradius container has no custom image, it runs `apt-get install curl
+ca-certificates` once at every container start (the stock image ships
+`openssl` but not `curl`, which the verify hook needs) — adds a few seconds
+to startup and needs outbound network access to Ubuntu's package mirrors. If
+that's undesirable (offline hosts, faster restarts), build your own image
+from this repo's `scripts/` instead and point `docker-compose.yaml` at it.
 
 ## Prerequisites
 
@@ -43,18 +53,18 @@ docker compose up -d
 are your main debugging entry points; `curl http://localhost:8080/healthz`
 from inside the `intune-radius-helper` container reports cache/backend health.
 
-## Updating images
+## Updating
 
-Both images are published on pushes to their respective repos'
-`main`/tags. Pull the latest with:
+Pull the latest upstream FreeRADIUS and helper images with:
 
 ```
 docker compose pull
 docker compose up -d
 ```
 
-Pin specific versions in `docker-compose.yaml` (`:v0.1.0` etc.) if you want
-controlled upgrades instead of tracking `:latest`.
+Pin a specific helper version in `docker-compose.yaml` (`:v0.1.0` etc.) if
+you want controlled upgrades instead of tracking `:latest`. `scripts/*.sh`
+are part of this repo, so `git pull` picks up changes to those directly.
 
 ## License
 
