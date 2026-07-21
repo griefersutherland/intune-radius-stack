@@ -231,6 +231,24 @@ For a fully real end-to-end test (through FreeRADIUS's actual `post-auth`
 `wpa_supplicant`, needs a build with `CONFIG_EAPOL_TEST=y`) against UDP
 `1812` with a real client cert/key and `RADIUS_SHARED_SECRET`.
 
+### VLAN assignment
+
+Four VLANs, independently enabled and tagged in `.env`:
+`WIFI_ACCESS_VLAN_{ENABLED,TAG}`, `WIFI_UNTRUST_VLAN_{ENABLED,TAG}`,
+`WIRED_ACCESS_VLAN_{ENABLED,TAG}`, `WIRED_UNTRUST_VLAN_{ENABLED,TAG}`.
+Medium (wifi vs wired) is read from the `NAS-Port-Type` RADIUS attribute the
+AP/switch sends (`Wireless-802.11` vs `Ethernet`) - confirm your hardware
+actually sends it before relying on this.
+
+- `access` tier with no VLAN configured for the matching medium: plain
+  accept, no VLAN attribute (client falls back to whatever the AP/switch
+  does by default).
+- `untrust` tier with no VLAN configured for the matching medium: **reject**
+  instead - if you've enabled an untrust tier at all, an unspecified
+  network isn't an acceptable place to leave a non-compliant device, so
+  this fails closed rather than silently falling back to "no VLAN".
+- `reject` tier: always rejected, regardless of VLAN config.
+
 ### RADIUS clients (APs / switches)
 
 Point your access points or switches' RADIUS configuration at this host on
@@ -250,8 +268,23 @@ docker compose up -d
 ```
 
 Pin a specific helper version in `docker-compose.yaml` (`:v0.1.0` etc.) if
-you want controlled upgrades instead of tracking `:latest`. `scripts/*.sh`
-are part of this repo, so `git pull` picks up changes to those directly.
+you want controlled upgrades instead of tracking `:latest`.
+
+`scripts/*.sh` are part of this repo and bind-mounted individually
+(`./scripts/foo.sh:/usr/local/bin/foo.sh:ro`) rather than as a directory -
+`git pull` updates the file on the host, but Docker's single-file bind
+mounts can end up pointing at the old inode if git replaces rather than
+edits the file in place (which it normally does), so an *already-running*
+freeradius container can silently keep executing the old script content.
+After pulling script changes, force a recreate to be sure:
+
+```
+docker compose up -d --force-recreate freeradius
+```
+
+(A plain `docker compose up -d` after other changes, like `.env` edits,
+already recreates the container as needed - this only matters for changes
+that touch *just* the bind-mounted script files.)
 
 ## License
 
