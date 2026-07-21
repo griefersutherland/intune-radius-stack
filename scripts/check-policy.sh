@@ -39,13 +39,33 @@ SANITIZED_MAC="$(printf '%s' "$CALLING_STATION_ID" | tr -cd 'A-Fa-f0-9' | tr 'A-
 CERT_FILE="$CERT_STAGE_DIR/${SANITIZED_MAC}.pem"
 [ -f "$CERT_FILE" ] || fail_closed
 
-REQUEST_JSON="$(awk -v user="$RADIUS_USERNAME" -v csid="$CALLING_STATION_ID" '
+# RADIUS_USERNAME/CALLING_STATION_ID are passed via the environment (ENVIRON[]),
+# not `awk -v` - awk's `-v var=value` assignments undergo their own escape-sequence
+# interpretation (implementation-defined for sequences awk doesn't recognize,
+# e.g. mawk - the actual awk in this image - passes a literal `\S` straight
+# through), which is exactly the kind of surprise this needs to avoid when the
+# value can contain arbitrary characters (a Windows supplicant sending
+# `DOMAIN\user` as User-Name will otherwise break the JSON here).
+REQUEST_JSON="$(RADIUS_USERNAME="$RADIUS_USERNAME" CALLING_STATION_ID="$CALLING_STATION_ID" awk '
+function jsonescape(s) {
+  # gsub replacement text has its own backslash handling too: a
+  # single escaped backslash in the replacement is a no-op (it means
+  # "insert what matched"), so doubling a literal backslash needs
+  # four backslashes here, not two - verified empirically against
+  # this images own mawk, not assumed.
+  gsub(/\\/, "\\\\\\\\", s)
+  gsub(/"/, "\\\"", s)
+  gsub(/\t/, "\\t", s)
+  gsub(/\r/, "\\r", s)
+  gsub(/\n/, "\\n", s)
+  return s
+}
 BEGIN { printf("{"); printf("\"cert_pem\":\"") }
-{ gsub(/\\/,"\\\\"); gsub(/"/,"\\\""); printf("%s\\n", $0) }
+{ gsub(/\\/,"\\\\\\\\"); gsub(/"/,"\\\""); printf("%s\\n", $0) }
 END {
   printf("\",")
-  printf("\"radius_username\":\"%s\",", user)
-  printf("\"calling_station_id\":\"%s\"", csid)
+  printf("\"radius_username\":\"%s\",", jsonescape(ENVIRON["RADIUS_USERNAME"]))
+  printf("\"calling_station_id\":\"%s\"", jsonescape(ENVIRON["CALLING_STATION_ID"]))
   printf("}")
 }
 ' "$CERT_FILE")"
