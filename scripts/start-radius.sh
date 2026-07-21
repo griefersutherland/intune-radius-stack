@@ -24,6 +24,11 @@ RADIUS_CLIENT_NAME="$(printf '%s' "$RADIUS_CLIENT_NAME_RAW" | sed 's/[^A-Za-z0-9
 RADIUS_CLIENT_IPADDRS="${RADIUS_CLIENT_IPADDRS:-${RADIUS_CLIENT_IPADDR:-}}"
 FREERADIUS_DEBUG="${FREERADIUS_DEBUG:-true}"
 
+EXPECTED_ISSUER_CN="${EXPECTED_ISSUER_CN:?EXPECTED_ISSUER_CN env var is required (issuing CA's CN)}"
+URN_PREFIX="${URN_PREFIX:-urn:example.com}"
+HELPER_URL="${HELPER_URL:-http://intune-radius-helper:8080/check}"
+CERT_STAGE_DIR="${CERT_STAGE_DIR:-/var/run/freeradius/cert-stage}"
+
 is_true() {
   case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
     true|yes|1|on) return 0 ;;
@@ -72,6 +77,31 @@ fi
 mkdir -p /var/run/freeradius/tls-tmp
 chown -R freerad:freerad /var/run/freeradius/tls-tmp 2>/dev/null || true
 chmod 700 /var/run/freeradius/tls-tmp
+
+mkdir -p "$CERT_STAGE_DIR"
+chown -R freerad:freerad "$CERT_STAGE_DIR" 2>/dev/null || true
+chmod 700 "$CERT_STAGE_DIR"
+
+# verify-client-cert.sh and check-policy.sh are invoked by FreeRADIUS's own
+# verify{} hook and %{exec:...} xlat respectively - neither inherits this
+# container's environment (confirmed empirically: FreeRADIUS builds a fresh
+# environment from request attributes for external programs), so config
+# values are baked in here instead of read at runtime by those scripts.
+cat > /etc/freeradius/verify-config.sh <<VERIFY_CONFIG_EOF
+EXPECTED_ISSUER_CN="${EXPECTED_ISSUER_CN}"
+URN_PREFIX="${URN_PREFIX}"
+HELPER_URL="${HELPER_URL}"
+CERT_STAGE_DIR="${CERT_STAGE_DIR}"
+VERIFY_CONFIG_EOF
+
+cat > /etc/freeradius/mods-enabled/exec <<'EXEC_EOF'
+exec {
+    wait = yes
+    input_pairs = "request"
+    shell_escape = yes
+    timeout = 10
+}
+EXEC_EOF
 
 cat > /etc/freeradius/clients.conf <<CLIENTS_EOF
 client localhost {
@@ -151,46 +181,89 @@ ${CRL_BLOCK}
 }
 EAP_EOF
 
-# Medium (wifi vs wired) is read from NAS-Port-Type, which the AP/switch must
-# actually send. Only "Access" is wired into a live branch below - the
-# helper's allow/deny is the only signal available today, and reaching
-# post-auth already means the helper allowed this session. "Untrust" tags are
-# validated above (so bad config still fails fast) but deliberately have no
-# branch here; they're scaffolding for a future policy-engine signal that
-# doesn't exist yet.
-VLAN_BRANCHES=""
-
+# Policy decisions (access/untrust/reject) now happen here in post-auth via
+# check-policy.sh, not in verify-client-cert.sh - TLS-Client-Cert-Filename
+# does not persist from the verify{} hook into post-auth (confirmed
+# empirically), so the actual compliance call had to move to where FreeRADIUS
+# can natively branch on the result. Medium (wifi vs wired) is read from
+# NAS-Port-Type, which the AP/switch must actually send.
+#
+# "Access" without a configured VLAN for the matching medium is a plain
+# accept (no VLAN attributes) - same as before. "Untrust" without a
+# configured VLAN for the matching medium rejects instead of leaving an
+# untrusted client on an unspecified/default network - untrust existing at
+# all implies you intend to contain it somewhere specific.
+ACCESS_BRANCHES=""
 if is_true "$WIFI_ACCESS_VLAN_ENABLED"; then
-  VLAN_BRANCHES="${VLAN_BRANCHES}
-        if (&NAS-Port-Type == \"Wireless-802.11\") {
-            update reply {
-                Tunnel-Type = VLAN
-                Tunnel-Medium-Type = IEEE-802
-                Tunnel-Private-Group-Id = \"${WIFI_ACCESS_VLAN_TAG}\"
-            }
-        }"
+  ACCESS_BRANCHES="${ACCESS_BRANCHES}
+                if (&NAS-Port-Type == \"Wireless-802.11\") {
+                    update reply {
+                        Tunnel-Type = VLAN
+                        Tunnel-Medium-Type = IEEE-802
+                        Tunnel-Private-Group-Id = \"${WIFI_ACCESS_VLAN_TAG}\"
+                    }
+                }"
 fi
-
 if is_true "$WIRED_ACCESS_VLAN_ENABLED"; then
-  VLAN_BRANCHES="${VLAN_BRANCHES}
-        if (&NAS-Port-Type == \"Ethernet\") {
-            update reply {
-                Tunnel-Type = VLAN
-                Tunnel-Medium-Type = IEEE-802
-                Tunnel-Private-Group-Id = \"${WIRED_ACCESS_VLAN_TAG}\"
-            }
-        }"
+  ACCESS_BRANCHES="${ACCESS_BRANCHES}
+                if (&NAS-Port-Type == \"Ethernet\") {
+                    update reply {
+                        Tunnel-Type = VLAN
+                        Tunnel-Medium-Type = IEEE-802
+                        Tunnel-Private-Group-Id = \"${WIRED_ACCESS_VLAN_TAG}\"
+                    }
+                }"
 fi
 
-if [ -n "$VLAN_BRANCHES" ]; then
-  POST_AUTH_BLOCK="
-    post-auth {${VLAN_BRANCHES}
-    }"
-else
-  POST_AUTH_BLOCK='
-    post-auth {
-    }'
+UNTRUST_BRANCHES=""
+if is_true "$WIFI_UNTRUST_VLAN_ENABLED"; then
+  UNTRUST_BRANCHES="${UNTRUST_BRANCHES}
+                if (&NAS-Port-Type == \"Wireless-802.11\") {
+                    update reply {
+                        Tunnel-Type = VLAN
+                        Tunnel-Medium-Type = IEEE-802
+                        Tunnel-Private-Group-Id = \"${WIFI_UNTRUST_VLAN_TAG}\"
+                    }
+                    update control {
+                        Tmp-String-1 := \"yes\"
+                    }
+                }"
 fi
+if is_true "$WIRED_UNTRUST_VLAN_ENABLED"; then
+  UNTRUST_BRANCHES="${UNTRUST_BRANCHES}
+                if (&NAS-Port-Type == \"Ethernet\") {
+                    update reply {
+                        Tunnel-Type = VLAN
+                        Tunnel-Medium-Type = IEEE-802
+                        Tunnel-Private-Group-Id = \"${WIRED_UNTRUST_VLAN_TAG}\"
+                    }
+                    update control {
+                        Tmp-String-1 := \"yes\"
+                    }
+                }"
+fi
+
+POST_AUTH_BLOCK="
+    post-auth {
+        update control {
+            Tmp-String-0 := \"%{exec:/usr/local/bin/check-policy.sh %{Calling-Station-Id} %{User-Name}}\"
+        }
+        switch \"%{control:Tmp-String-0}\" {
+            case \"access\" {${ACCESS_BRANCHES}
+            }
+            case \"untrust\" {
+                update control {
+                    Tmp-String-1 := \"no\"
+                }${UNTRUST_BRANCHES}
+                if (\"%{control:Tmp-String-1}\" != \"yes\") {
+                    reject
+                }
+            }
+            case {
+                reject
+            }
+        }
+    }"
 
 cat > /etc/freeradius/sites-enabled/default <<SITE_EOF
 server default {
@@ -241,7 +314,7 @@ echo "Generated site VLAN config:"
 grep -nA8 -B2 "Tunnel-Private-Group-Id\|post-auth" /etc/freeradius/sites-enabled/default || true
 
 echo
-echo "VLAN policy (Untrust tiers are validated but not yet assigned - pending policy-engine integration):"
+echo "VLAN policy (access/untrust tier is decided per-request by check-policy.sh; a tier with no VLAN configured for the matching medium falls back to plain accept for access, or reject for untrust):"
 for _vlan_summary in \
   "wifi_access:${WIFI_ACCESS_VLAN_ENABLED}:${WIFI_ACCESS_VLAN_TAG}" \
   "wifi_untrust:${WIFI_UNTRUST_VLAN_ENABLED}:${WIFI_UNTRUST_VLAN_TAG}" \

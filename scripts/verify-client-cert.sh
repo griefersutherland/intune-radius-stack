@@ -1,5 +1,5 @@
 #!/bin/sh
-# freeradius-wifi-eap-tls - client certificate identity/EKU/CRL verify hook, calls the compliance helper
+# freeradius-wifi-eap-tls - client certificate structural verify hook
 # Copyright (C) 2026  griefersutherland
 #
 # This program is free software: you can redistribute it and/or modify
@@ -17,14 +17,20 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+# FreeRADIUS invokes this program with a freshly-built environment derived
+# from RADIUS request attributes - it does NOT inherit this container's own
+# environment (confirmed empirically; process env vars like EXPECTED_ISSUER_CN
+# set via docker-compose are simply not visible here). So config values are
+# baked into /etc/freeradius/verify-config.sh by start-radius.sh at container
+# startup (real env expansion happens there, in a process that does have a
+# normal environment) and sourced below instead of read from `$VAR` directly.
+. /etc/freeradius/verify-config.sh
+
 CERT="$1"
 RADIUS_USERNAME="${2:-}"
 CALLING_STATION_ID="${3:-}"
 
 LOG="/logs/radius-verify.log"
-HELPER_URL="${HELPER_URL:-http://intune-radius-helper:8080/check}"
-URN_PREFIX="${URN_PREFIX:-urn:example.com}"
-EXPECTED_ISSUER_CN="${EXPECTED_ISSUER_CN:?EXPECTED_ISSUER_CN env var is required (issuing CA's CN)}"
 
 fail() {
   echo "$(date -Iseconds) FAIL: $*" >> "$LOG"
@@ -66,35 +72,20 @@ echo "$TEXT" | grep -q "URI:${URN_PREFIX}:entra-user-id:" || \
 echo "$TEXT" | grep -q "URI:${URN_PREFIX}:user-upn:" || \
 fail "missing expected ${URN_PREFIX} SAN URI"
 
-awk '
-BEGIN {
-  printf("{")
-  printf("\"cert_pem\":\"")
-}
-{
-  gsub(/\\/,"\\\\")
-  gsub(/"/,"\\\"")
-  printf("%s\\n", $0)
-}
-END {
-  printf("\",")
-  printf("\"radius_username\":\"%s\",", ENVIRON["RADIUS_USERNAME"])
-  printf("\"calling_station_id\":\"%s\"", ENVIRON["CALLING_STATION_ID"])
-  printf("}")
-}
-' "$CERT" > /tmp/intune-radius-helper-request.json
+# Stage the cert PEM for the policy check, which now happens in post-auth
+# via check-policy.sh (see start-radius.sh) - this hook can no longer hand
+# attributes forward to post-auth directly (TLS-Client-Cert-Filename does
+# not persist that far; confirmed empirically), so the cert is written to a
+# location check-policy.sh can read back, keyed by a strictly-sanitized
+# Calling-Station-Id since that value is attacker-influenced input reaching
+# a filesystem path.
+SANITIZED_MAC="$(printf '%s' "$CALLING_STATION_ID" | tr -cd 'A-Fa-f0-9' | tr 'A-F' 'a-f')"
+if [ "${#SANITIZED_MAC}" -ne 12 ]; then
+  fail "Calling-Station-Id does not look like a MAC address: ${CALLING_STATION_ID}"
+fi
 
-HTTP_CODE="$(curl -sS -o /tmp/intune-radius-helper-response.json -w "%{http_code}" \
-  -X POST \
-  -H "Content-Type: application/json" \
-  --data @/tmp/intune-radius-helper-request.json \
-  "$HELPER_URL" 2>> "$LOG")"
+mkdir -p "$CERT_STAGE_DIR"
+cp "$CERT" "$CERT_STAGE_DIR/${SANITIZED_MAC}.pem"
 
-echo "Helper HTTP ${HTTP_CODE}" >> "$LOG"
-cat /tmp/intune-radius-helper-response.json >> "$LOG"
-echo >> "$LOG"
-
-[ "$HTTP_CODE" = "200" ] || fail "helper denied or errored"
-
-passlog "certificate and helper policy allowed"
+passlog "certificate structurally valid, staged for policy check as ${SANITIZED_MAC}.pem"
 exit 0

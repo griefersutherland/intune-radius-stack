@@ -75,6 +75,7 @@ services:
     volumes:
       - ./scripts/start-radius.sh:/usr/local/bin/start-radius.sh:ro
       - ./scripts/verify-client-cert.sh:/usr/local/bin/verify-client-cert.sh:ro
+      - ./scripts/check-policy.sh:/usr/local/bin/check-policy.sh:ro
       - ./certs:/etc/freeradius/certs:ro
       - ./logs:/logs
     networks:
