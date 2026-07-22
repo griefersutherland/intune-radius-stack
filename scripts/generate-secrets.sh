@@ -32,12 +32,13 @@ fi
 
 set_secret() {
   var="$1"
+  bytes="${2:-32}"
   current="$(grep -E "^${var}=" .env | cut -d'=' -f2-)"
   if [ -n "$current" ] && [ "$FORCE" -ne 1 ]; then
     echo "  $var already set, skipping (use --force to overwrite)"
     return
   fi
-  value="$(openssl rand -hex 32)"
+  value="$(openssl rand -hex "$bytes")"
   sed -i "s/^${var}=.*/${var}=${value}/" .env
   echo "  $var generated"
 }
@@ -45,7 +46,11 @@ set_secret() {
 echo "Generating local secrets in .env..."
 set_secret POSTGRES_PASSWORD
 set_secret REDIS_PASSWORD
-set_secret RADIUS_SHARED_SECRET
+# 24 bytes -> 48 hex chars: some APs/switches cap RADIUS shared secret length
+# (commonly around 48-63 chars) - stay at exactly 48 rather than the default
+# 64 to be safe across hardware, while still keeping well above what's
+# actually needed for a shared secret's entropy.
+set_secret RADIUS_SHARED_SECRET 24
 
 chmod 600 .env
 
