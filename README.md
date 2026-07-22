@@ -172,12 +172,15 @@ permissions):
 
 ```
 ./scripts/generate-secrets.sh
-# creates .env from .env.example and fills in random
-# POSTGRES_PASSWORD / REDIS_PASSWORD / RADIUS_SHARED_SECRET
-# (--force to regenerate ones that are already set)
+# creates .env from .env.example and fills in random POSTGRES_PASSWORD /
+# REDIS_PASSWORD, plus a NAS_SECRET_<SITE> for each site you've already
+# defined via NAS_CIDR_<SITE> in .env (--force to regenerate ones that are
+# already set)
 
 # then fill in by hand: TENANT_ID / CLIENT_ID / CLIENT_SECRET (from the app
-# registration above), RADIUS_CLIENT_IPADDRS, EXPECTED_ISSUER_CN, URN_PREFIX
+# registration above), EXPECTED_ISSUER_CN, URN_PREFIX, and your real sites -
+# NAS_CIDR_<SITE> / VLAN_*_<SITE> (see .env.example) - then re-run
+# generate-secrets.sh to fill in each site's NAS_SECRET_<SITE>
 
 mkdir -p certs logs config
 # place ca-chain.pem, radius-server.key, radius-server-chain.pem from the
@@ -229,34 +232,46 @@ policy engine are working end to end. Check
 For a fully real end-to-end test (through FreeRADIUS's actual `post-auth`
 `unlang`, not just these two scripts run by hand), use `eapol_test` (from
 `wpa_supplicant`, needs a build with `CONFIG_EAPOL_TEST=y`) against UDP
-`1812` with a real client cert/key and `RADIUS_SHARED_SECRET`.
+`1812` with a real client cert/key and the relevant site's `NAS_SECRET_<SITE>`.
 
-### VLAN assignment
+### Sites, RADIUS clients (APs / switches), and VLAN assignment
 
-Four VLANs, independently enabled and tagged in `.env`:
-`WIFI_ACCESS_VLAN_{ENABLED,TAG}`, `WIFI_UNTRUST_VLAN_{ENABLED,TAG}`,
-`WIRED_ACCESS_VLAN_{ENABLED,TAG}`, `WIRED_UNTRUST_VLAN_{ENABLED,TAG}`.
-Medium (wifi vs wired) is read from the `NAS-Port-Type` RADIUS attribute the
-AP/switch sends (`Wireless-802.11` vs `Ethernet`) - confirm your hardware
-actually sends it before relying on this.
-
-- `access` tier with no VLAN configured for the matching medium: plain
-  accept, no VLAN attribute (client falls back to whatever the AP/switch
-  does by default).
-- `untrust` tier with no VLAN configured for the matching medium: **reject**
-  instead - if you've enabled an untrust tier at all, an unspecified
-  network isn't an acceptable place to leave a non-compliant device, so
-  this fails closed rather than silently falling back to "no VLAN".
-- `reject` tier: always rejected, regardless of VLAN config.
-
-### RADIUS clients (APs / switches)
+Sites are entirely user-defined, not a fixed list — any `NAS_CIDR_<SITE>` in
+`.env` defines a site (`<SITE>` can be anything valid in an env var name:
+letters, digits, underscore — e.g. `BOSTON`, `NY`, `WAREHOUSE_3`).
+`start-radius.sh` discovers every `NAS_CIDR_<SITE>` at container start and
+generates a FreeRADIUS `client { }` block per NAS IP/CIDR for that site, all
+sharing that site's `NAS_SECRET_<SITE>` and a `shortname` equal to the site
+name (this is how the policy logic below identifies which site a request
+came from — see `Client-Shortname` in `start-radius.sh`).
 
 Point your access points or switches' RADIUS configuration at this host on
-UDP `1812` (auth) and `1813` (accounting), using `RADIUS_SHARED_SECRET` from
-`.env`. Each AP/switch's source IP must fall inside `RADIUS_CLIENT_IPADDRS`
-(comma-separated CIDRs/IPs) or FreeRADIUS will silently drop its requests —
-check `docker compose logs freeradius` for `Ignoring request... unknown
-client` if auth attempts don't show up at all.
+UDP `1812` (auth) and `1813` (accounting), using the shared secret from that
+site's `NAS_SECRET_<SITE>`. Each AP/switch's source IP must fall inside its
+site's `NAS_CIDR_<SITE>` (comma-separated CIDRs/IPs for multiple per site) or
+FreeRADIUS will silently drop its requests — check `docker compose logs
+freeradius` for `Ignoring request... unknown client` if auth attempts don't
+show up at all.
+
+Per site, up to four VLANs are independently optional:
+`VLAN_ACCESS_WIFI_<SITE>`, `VLAN_ACCESS_WIRED_<SITE>`,
+`VLAN_UNTRUST_WIFI_<SITE>`, `VLAN_UNTRUST_WIRED_<SITE>`. Medium (wifi vs
+wired) is read from the `NAS-Port-Type` RADIUS attribute the AP/switch sends
+(`Wireless-802.11` vs `Ethernet`) - confirm your hardware actually sends it
+before relying on this.
+
+- `access` tier with no VLAN configured for the matching site+medium: plain
+  accept, no VLAN attribute (client falls back to whatever the AP/switch
+  does by default).
+- `untrust` tier with no VLAN configured for the matching site+medium:
+  **reject** instead - if you've enabled an untrust tier at all, an
+  unspecified network isn't an acceptable place to leave a non-compliant
+  device, so this fails closed rather than silently falling back to "no
+  VLAN".
+- `reject` tier: always rejected, regardless of site or VLAN config.
+
+See the commented example in `.env.example` for the full set of per-site
+variables.
 
 ## Updating
 

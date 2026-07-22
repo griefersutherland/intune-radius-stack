@@ -33,24 +33,39 @@ fi
 set_secret() {
   var="$1"
   bytes="${2:-32}"
-  current="$(grep -E "^${var}=" .env | cut -d'=' -f2-)"
-  if [ -n "$current" ] && [ "$FORCE" -ne 1 ]; then
-    echo "  $var already set, skipping (use --force to overwrite)"
-    return
+  if grep -qE "^${var}=" .env; then
+    current="$(grep -E "^${var}=" .env | head -1 | cut -d'=' -f2-)"
+    if [ -n "$current" ] && [ "$FORCE" -ne 1 ]; then
+      echo "  $var already set, skipping (use --force to overwrite)"
+      return
+    fi
+    value="$(openssl rand -hex "$bytes")"
+    sed -i "s/^${var}=.*/${var}=${value}/" .env
+  else
+    value="$(openssl rand -hex "$bytes")"
+    echo "${var}=${value}" >> .env
   fi
-  value="$(openssl rand -hex "$bytes")"
-  sed -i "s/^${var}=.*/${var}=${value}/" .env
   echo "  $var generated"
 }
 
 echo "Generating local secrets in .env..."
 set_secret POSTGRES_PASSWORD
 set_secret REDIS_PASSWORD
-# 24 bytes -> 48 hex chars: some APs/switches cap RADIUS shared secret length
-# (commonly around 48-63 chars) - stay at exactly 48 rather than the default
-# 64 to be safe across hardware, while still keeping well above what's
-# actually needed for a shared secret's entropy.
-set_secret RADIUS_SHARED_SECRET 24
+
+# Sites are user-defined (uncomment/add NAS_CIDR_<SITE> in .env yourself
+# first - see .env.example) - this discovers whatever sites are already
+# there and fills in a NAS_SECRET_<SITE> for each one missing it.
+SITES="$(grep -oE '^NAS_CIDR_[A-Za-z0-9_]+=' .env | sed -E 's/^NAS_CIDR_//; s/=$//' | sort -u)"
+if [ -z "$SITES" ]; then
+  echo "  no NAS_CIDR_<SITE> entries found in .env - add your real sites first (see .env.example), then re-run this to fill in their NAS_SECRET_<SITE> values"
+else
+  for SITE in $SITES; do
+    # 24 bytes -> 48 hex chars: some APs/switches cap RADIUS shared secret
+    # length (commonly around 48-63 chars) - stay at exactly 48 rather than
+    # the default 64 to be safe across hardware.
+    set_secret "NAS_SECRET_${SITE}" 24
+  done
+fi
 
 chmod 600 .env
 
@@ -59,7 +74,7 @@ cat <<'EOF'
 Done. These still need to be filled in by hand (not generatable locally):
   TENANT_ID, CLIENT_ID, CLIENT_SECRET   - from the Entra app registration
   EXPECTED_ISSUER_CN                    - your PKI's issuing CA CN
-  RADIUS_CLIENT_IPADDRS                 - your APs'/switches' IPs or CIDRs
+  NAS_CIDR_<SITE> / VLAN_*_<SITE>       - your sites' NAS IPs/CIDRs and VLAN tags (see .env.example)
   URN_PREFIX                            - must match what your PKI issues in cert SAN URIs
 
 Note: POSTGRES_PASSWORD/REDIS_PASSWORD only take effect on a fresh
