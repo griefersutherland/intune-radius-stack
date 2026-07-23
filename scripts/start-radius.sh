@@ -321,6 +321,16 @@ ${POST_AUTH_BLOCK}
     Post-Auth-Type REJECT {
         attr_filter.access_reject
     }
+
+    preacct {
+        preprocess
+        acct_unique
+    }
+
+    accounting {
+        attr_filter.accounting_response
+        ok
+    }
 }
 SITE_EOF
 
