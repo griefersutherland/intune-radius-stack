@@ -49,7 +49,7 @@ if is_true "$RADSEC_ENABLED"; then
   # disables - confirmed empirically: freeradius refuses to start a TLS
   # listener under -X at all ("Threading must be enabled for TLS sockets").
   if is_true "$FREERADIUS_DEBUG"; then
-    echo "ERROR: RADSEC_ENABLED=true is not compatible with FREERADIUS_DEBUG=true (TLS sockets require threading, which -X debug mode disables). Set FREERADIUS_DEBUG=false to use RadSec."
+    echo "ERROR: RADSEC_ENABLED=true is not compatible with FREERADIUS_DEBUG=true (TLS sockets require threading, which -X debug mode disables). Set FREERADIUS_DEBUG=false (or FREERADIUS_DEBUG=verbose for threaded/verbose logging - freeradius -fxx -l stdout) to use RadSec."
     exit 1
   fi
 
@@ -474,6 +474,11 @@ echo "FREERADIUS_DEBUG=${FREERADIUS_DEBUG}"
 
 if [ "$FREERADIUS_DEBUG" = "true" ] || [ "$FREERADIUS_DEBUG" = "yes" ] || [ "$FREERADIUS_DEBUG" = "1" ]; then
   exec freeradius -X
+elif [ "$FREERADIUS_DEBUG" = "verbose" ]; then
+  # -X (full debug) disables threading, which TLS sockets require - this is
+  # the threaded equivalent FreeRADIUS itself suggests when it refuses to
+  # start under -X with a TLS listener configured (RadSec or EAP-TLS).
+  exec freeradius -fxx -l stdout
 else
   exec freeradius -f
 fi
