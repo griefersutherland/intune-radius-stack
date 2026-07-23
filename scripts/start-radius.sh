@@ -25,6 +25,51 @@ URN_PREFIX="${URN_PREFIX:-urn:example.com}"
 HELPER_URL="${HELPER_URL:-http://intune-radius-helper:8080/check}"
 CERT_STAGE_DIR="${CERT_STAGE_DIR:-/var/run/freeradius/cert-stage}"
 
+# RadSec (RFC 6614 - RADIUS over TLS, RFC 6613 transport). Reuses the same
+# server cert/key/CA already used for EAP-TLS - RadSec's TLS is just the
+# server proving its identity for the RADIUS transport itself, the same
+# identity claim the EAP-TLS listener already makes, so a second
+# cert-issuance path buys nothing. Peers must present a client cert signed by
+# the same CA (mutual TLS) - verified against a real container: an untrusted
+# cert or no cert both get a TLS-level handshake failure, only a CA-signed
+# peer cert is accepted.
+RADSEC_ENABLED="${RADSEC_ENABLED:-false}"
+RADSEC_PORT="${RADSEC_PORT:-2083}"
+RADSEC_CLIENT_CIDR="${RADSEC_CLIENT_CIDR:-}"
+
+is_true() {
+  case "$1" in
+    true|yes|1) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if is_true "$RADSEC_ENABLED"; then
+  # TLS sockets require threading, which -X (single-threaded debug mode)
+  # disables - confirmed empirically: freeradius refuses to start a TLS
+  # listener under -X at all ("Threading must be enabled for TLS sockets").
+  if is_true "$FREERADIUS_DEBUG"; then
+    echo "ERROR: RADSEC_ENABLED=true is not compatible with FREERADIUS_DEBUG=true (TLS sockets require threading, which -X debug mode disables). Set FREERADIUS_DEBUG=false to use RadSec."
+    exit 1
+  fi
+
+  case "$RADSEC_PORT" in
+    ''|*[!0-9]*)
+      echo "ERROR: RADSEC_PORT must be numeric, got '${RADSEC_PORT}'"
+      exit 1
+      ;;
+  esac
+  if [ "$RADSEC_PORT" -lt 1 ] || [ "$RADSEC_PORT" -gt 65535 ]; then
+    echo "ERROR: RADSEC_PORT=${RADSEC_PORT} is out of the valid port range (1-65535)"
+    exit 1
+  fi
+
+  if [ -z "$RADSEC_CLIENT_CIDR" ]; then
+    echo "ERROR: RADSEC_CLIENT_CIDR is required when RADSEC_ENABLED=true (comma-separated IP/CIDR of allowed RadSec peers)"
+    exit 1
+  fi
+fi
+
 validate_vlan_tag() {
   # $1 = env var name (for error messages), $2 = tag value
   case "$2" in
@@ -214,6 +259,66 @@ CLIENT_EOF
             }"
 done
 
+# RadSec needs its own *named* clients block (not the plain clients.conf
+# entries above), referenced by the listener via `clients = radsec` -
+# confirmed against a real container that a plain clients.conf entry with
+# proto = tls is rejected ("Client does not have the same TLS configuration
+# as the listener") without this separate named block.
+RADSEC_LISTEN_BLOCK=""
+if is_true "$RADSEC_ENABLED"; then
+  {
+    echo ""
+    echo "clients radsec {"
+    i=1
+    OLD_IFS="$IFS"
+    IFS=","
+    for ip in $RADSEC_CLIENT_CIDR; do
+      ip="$(printf '%s' "$ip" | xargs)"
+      if [ -n "$ip" ]; then
+        cat <<RADSEC_CLIENT_EOF
+    client radsec_${i} {
+        ipaddr = ${ip}
+        proto = tls
+        secret = radsec
+    }
+RADSEC_CLIENT_EOF
+        i=$((i + 1))
+      fi
+    done
+    IFS="$OLD_IFS"
+    echo "}"
+  } >> /etc/freeradius/clients.conf
+
+  if [ "$i" -eq 1 ]; then
+    echo "ERROR: RADSEC_CLIENT_CIDR did not contain any usable IP/CIDR entries"
+    exit 1
+  fi
+
+  RADSEC_LISTEN_BLOCK="
+    listen {
+        type = auth+acct
+        ipaddr = *
+        port = ${RADSEC_PORT}
+        proto = tcp
+        virtual_server = default
+        clients = radsec
+
+        limit {
+            max_connections = 16
+            lifetime = 0
+            idle_timeout = 30
+        }
+
+        tls {
+            private_key_file = /etc/freeradius/certs/radius-server.key
+            certificate_file = /etc/freeradius/certs/radius-server-chain.pem
+            ca_file = /etc/freeradius/certs/ca-chain.pem
+            cipher_list = \"HIGH\"
+            require_client_cert = yes
+        }
+    }"
+fi
+
 if [ "${ENABLE_CRL_VERIFICATION:-false}" = "true" ] || [ "${ENABLE_CRL_VERIFICATION:-false}" = "yes" ] || [ "${ENABLE_CRL_VERIFICATION:-false}" = "1" ]; then
   CRL_BLOCK='
         check_crl = yes
@@ -300,6 +405,7 @@ server default {
         ipaddr = *
         port = 1813
     }
+${RADSEC_LISTEN_BLOCK}
 
     authorize {
         filter_username
@@ -355,6 +461,13 @@ for SITE in $SITES; do
   eval "SITE_VLAN_UNTRUST_WIRED=\"\${VLAN_UNTRUST_WIRED_${SITE}:-}\""
   echo "  ${SITE}: nas=${SITE_NAS_CIDR} wifi_access=${SITE_VLAN_ACCESS_WIFI:-none} wired_access=${SITE_VLAN_ACCESS_WIRED:-none} wifi_untrust=${SITE_VLAN_UNTRUST_WIFI:-none} wired_untrust=${SITE_VLAN_UNTRUST_WIRED:-none}"
 done
+
+echo
+if is_true "$RADSEC_ENABLED"; then
+  echo "RadSec: enabled on TCP ${RADSEC_PORT}, peers=${RADSEC_CLIENT_CIDR}"
+else
+  echo "RadSec: disabled"
+fi
 
 echo
 echo "FREERADIUS_DEBUG=${FREERADIUS_DEBUG}"

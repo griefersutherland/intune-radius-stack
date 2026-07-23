@@ -72,6 +72,9 @@ services:
     ports:
       - "1812:1812/udp"
       - "1813:1813/udp"
+      # Always published - inert unless RADSEC_ENABLED=true (nothing listens
+      # on it otherwise, so connection attempts just get refused).
+      - "${RADSEC_PORT:-2083}:${RADSEC_PORT:-2083}/tcp"
     volumes:
       - ./scripts/start-radius.sh:/usr/local/bin/start-radius.sh:ro
       - ./scripts/verify-client-cert.sh:/usr/local/bin/verify-client-cert.sh:ro

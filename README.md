@@ -279,6 +279,52 @@ before relying on this.
 See the commented example in `.env.example` for the full set of per-site
 variables.
 
+### RadSec (RADIUS over TLS)
+
+For a RadSec peer (RFC 6614) — a proxy, or another RADIUS server forwarding
+requests to this one — instead of a plain UDP NAS. Independent of the
+per-site NAS clients above; enable it with:
+
+```
+RADSEC_ENABLED=true
+RADSEC_PORT=2083
+RADSEC_CLIENT_CIDR=10.0.0.5,10.0.0.6   # comma-separated IP/CIDR of allowed peers
+```
+
+It reuses the same server cert/key/CA already set up for EAP-TLS
+(`certs/radius-server.key`, `-chain.pem`, `ca-chain.pem`) — RadSec's TLS is
+just the server proving its identity for RADIUS transport, the same claim
+EAP-TLS already makes, so there's no separate cert to provision.
+
+**This is mutual TLS, not optional.** The peer must present a client cert
+signed by the same CA as your other client certs (see "Requesting a one-off
+client cert manually" above to mint one) — verified against a real
+container: a cert from a different/self-signed CA, or no client cert at all,
+both get rejected at the TLS handshake itself (`unknown CA` / `handshake
+failure` in the log), before any RADIUS packet is processed. There is no
+shared-secret-only mode; the `secret = radsec` FreeRADIUS generates
+internally for these clients is [RFC 6614's own
+convention](https://www.rfc-editor.org/rfc/rfc6614) for TLS-only clients
+(kept only for the RADIUS packet format's sake) — the actual security is the
+mutual TLS handshake, not that value.
+
+**Not compatible with `FREERADIUS_DEBUG=true`.** TLS sockets require
+threading, which FreeRADIUS's `-X` debug mode disables — confirmed against a
+real container (`Threading must be enabled for TLS sockets to function
+properly`). The container refuses to start with a clear error if you have
+both set, rather than silently starting without the RadSec listener.
+
+To test a peer connection without a full RadSec client, confirm the mutual
+TLS handshake directly:
+
+```bash
+# should succeed (peer cert signed by your CA)
+openssl s_client -connect <server>:2083 -cert peer.crt -key peer.key -CAfile ca-chain.pem
+
+# should fail at the TLS layer (no cert presented)
+openssl s_client -connect <server>:2083 -CAfile ca-chain.pem
+```
+
 ## Updating
 
 Pull the latest upstream FreeRADIUS and helper images with:
