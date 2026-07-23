@@ -33,9 +33,19 @@ CERT_STAGE_DIR="${CERT_STAGE_DIR:-/var/run/freeradius/cert-stage}"
 # the same CA (mutual TLS) - verified against a real container: an untrusted
 # cert or no cert both get a TLS-level handshake failure, only a CA-signed
 # peer cert is accepted.
+#
+# RadSec peers are tied to a site via RADSEC_CLIENT_CIDR_<SITE> (same site
+# names as NAS_CIDR_<SITE>) rather than one flat global CIDR list - a RadSec
+# connection is matched to a client{} block the same as any other, and that
+# block's shortname is what Client-Shortname resolves to in post-auth.
+# Without a site-specific shortname, a RadSec-arriving request wouldn't match
+# any of the per-site switch cases below and would always fall through to
+# reject regardless of its actual compliance tier - confirmed against a real
+# production request (check-policy.sh had correctly returned "access", but
+# Client-Shortname resolved to the generic RadSec client name, matching no
+# case and rejecting anyway).
 RADSEC_ENABLED="${RADSEC_ENABLED:-false}"
 RADSEC_PORT="${RADSEC_PORT:-2083}"
-RADSEC_CLIENT_CIDR="${RADSEC_CLIENT_CIDR:-}"
 
 is_true() {
   case "$1" in
@@ -61,11 +71,6 @@ if is_true "$RADSEC_ENABLED"; then
   esac
   if [ "$RADSEC_PORT" -lt 1 ] || [ "$RADSEC_PORT" -gt 65535 ]; then
     echo "ERROR: RADSEC_PORT=${RADSEC_PORT} is out of the valid port range (1-65535)"
-    exit 1
-  fi
-
-  if [ -z "$RADSEC_CLIENT_CIDR" ]; then
-    echo "ERROR: RADSEC_CLIENT_CIDR is required when RADSEC_ENABLED=true (comma-separated IP/CIDR of allowed RadSec peers)"
     exit 1
   fi
 fi
@@ -145,6 +150,12 @@ CLIENTS_EOF
 # entries for the same site).
 SITE_SWITCH_CASES=""
 
+# Accumulated across sites, written as one `clients radsec { }` block after
+# the loop (each site's RadSec peers get shortname = that site, same as its
+# plain NAS clients - see the RadSec comment above for why).
+RADSEC_CLIENTS_BLOCK=""
+RADSEC_ANY_SITE=0
+
 for SITE in $SITES; do
   eval "SITE_NAS_CIDR=\"\${NAS_CIDR_${SITE}}\""
   eval "SITE_NAS_SECRET=\"\${NAS_SECRET_${SITE}:-}\""
@@ -152,6 +163,7 @@ for SITE in $SITES; do
   eval "SITE_VLAN_ACCESS_WIRED=\"\${VLAN_ACCESS_WIRED_${SITE}:-}\""
   eval "SITE_VLAN_UNTRUST_WIFI=\"\${VLAN_UNTRUST_WIFI_${SITE}:-}\""
   eval "SITE_VLAN_UNTRUST_WIRED=\"\${VLAN_UNTRUST_WIRED_${SITE}:-}\""
+  eval "SITE_RADSEC_CIDR=\"\${RADSEC_CLIENT_CIDR_${SITE}:-}\""
 
   if [ -z "$SITE_NAS_SECRET" ]; then
     echo "ERROR: NAS_SECRET_${SITE} is required (site ${SITE} defines NAS_CIDR_${SITE} but no secret)"
@@ -162,6 +174,11 @@ for SITE in $SITES; do
   [ -z "$SITE_VLAN_ACCESS_WIRED" ] || validate_vlan_tag "VLAN_ACCESS_WIRED_${SITE}" "$SITE_VLAN_ACCESS_WIRED"
   [ -z "$SITE_VLAN_UNTRUST_WIFI" ] || validate_vlan_tag "VLAN_UNTRUST_WIFI_${SITE}" "$SITE_VLAN_UNTRUST_WIFI"
   [ -z "$SITE_VLAN_UNTRUST_WIRED" ] || validate_vlan_tag "VLAN_UNTRUST_WIRED_${SITE}" "$SITE_VLAN_UNTRUST_WIRED"
+
+  if [ -n "$SITE_RADSEC_CIDR" ] && ! is_true "$RADSEC_ENABLED"; then
+    echo "ERROR: RADSEC_CLIENT_CIDR_${SITE} is set but RADSEC_ENABLED is not true - set RADSEC_ENABLED=true to use RadSec for this site"
+    exit 1
+  fi
 
   i=1
   OLD_IFS="$IFS"
@@ -187,6 +204,32 @@ CLIENT_EOF
   if [ "$i" -eq 1 ]; then
     echo "ERROR: NAS_CIDR_${SITE} did not contain any usable IP/CIDR entries"
     exit 1
+  fi
+
+  if [ -n "$SITE_RADSEC_CIDR" ]; then
+    RADSEC_ANY_SITE=1
+    j=1
+    OLD_IFS="$IFS"
+    IFS=","
+    for ip in $SITE_RADSEC_CIDR; do
+      ip="$(printf '%s' "$ip" | xargs)"
+      if [ -n "$ip" ]; then
+        RADSEC_CLIENTS_BLOCK="${RADSEC_CLIENTS_BLOCK}
+    client radsec_${SITE}_${j} {
+        ipaddr = ${ip}
+        proto = tls
+        secret = radsec
+        shortname = ${SITE}
+    }"
+        j=$((j + 1))
+      fi
+    done
+    IFS="$OLD_IFS"
+
+    if [ "$j" -eq 1 ]; then
+      echo "ERROR: RADSEC_CLIENT_CIDR_${SITE} did not contain any usable IP/CIDR entries"
+      exit 1
+    fi
   fi
 
   ACCESS_BRANCHES=""
@@ -263,36 +306,22 @@ done
 # entries above), referenced by the listener via `clients = radsec` -
 # confirmed against a real container that a plain clients.conf entry with
 # proto = tls is rejected ("Client does not have the same TLS configuration
-# as the listener") without this separate named block.
+# as the listener") without this separate named block. Built up per-site
+# during the loop above (RADSEC_CLIENTS_BLOCK), each entry's shortname
+# matching its site.
 RADSEC_LISTEN_BLOCK=""
 if is_true "$RADSEC_ENABLED"; then
+  if [ "$RADSEC_ANY_SITE" -eq 0 ]; then
+    echo "ERROR: RADSEC_ENABLED=true but no site defines RADSEC_CLIENT_CIDR_<SITE> - set at least one"
+    exit 1
+  fi
+
   {
     echo ""
     echo "clients radsec {"
-    i=1
-    OLD_IFS="$IFS"
-    IFS=","
-    for ip in $RADSEC_CLIENT_CIDR; do
-      ip="$(printf '%s' "$ip" | xargs)"
-      if [ -n "$ip" ]; then
-        cat <<RADSEC_CLIENT_EOF
-    client radsec_${i} {
-        ipaddr = ${ip}
-        proto = tls
-        secret = radsec
-    }
-RADSEC_CLIENT_EOF
-        i=$((i + 1))
-      fi
-    done
-    IFS="$OLD_IFS"
+    printf '%s\n' "$RADSEC_CLIENTS_BLOCK"
     echo "}"
   } >> /etc/freeradius/clients.conf
-
-  if [ "$i" -eq 1 ]; then
-    echo "ERROR: RADSEC_CLIENT_CIDR did not contain any usable IP/CIDR entries"
-    exit 1
-  fi
 
   RADSEC_LISTEN_BLOCK="
     listen {
@@ -459,12 +488,13 @@ for SITE in $SITES; do
   eval "SITE_VLAN_ACCESS_WIRED=\"\${VLAN_ACCESS_WIRED_${SITE}:-}\""
   eval "SITE_VLAN_UNTRUST_WIFI=\"\${VLAN_UNTRUST_WIFI_${SITE}:-}\""
   eval "SITE_VLAN_UNTRUST_WIRED=\"\${VLAN_UNTRUST_WIRED_${SITE}:-}\""
-  echo "  ${SITE}: nas=${SITE_NAS_CIDR} wifi_access=${SITE_VLAN_ACCESS_WIFI:-none} wired_access=${SITE_VLAN_ACCESS_WIRED:-none} wifi_untrust=${SITE_VLAN_UNTRUST_WIFI:-none} wired_untrust=${SITE_VLAN_UNTRUST_WIRED:-none}"
+  eval "SITE_RADSEC_CIDR=\"\${RADSEC_CLIENT_CIDR_${SITE}:-}\""
+  echo "  ${SITE}: nas=${SITE_NAS_CIDR} wifi_access=${SITE_VLAN_ACCESS_WIFI:-none} wired_access=${SITE_VLAN_ACCESS_WIRED:-none} wifi_untrust=${SITE_VLAN_UNTRUST_WIFI:-none} wired_untrust=${SITE_VLAN_UNTRUST_WIRED:-none} radsec_peers=${SITE_RADSEC_CIDR:-none}"
 done
 
 echo
 if is_true "$RADSEC_ENABLED"; then
-  echo "RadSec: enabled on TCP ${RADSEC_PORT}, peers=${RADSEC_CLIENT_CIDR}"
+  echo "RadSec: enabled on TCP ${RADSEC_PORT}"
 else
   echo "RadSec: disabled"
 fi

@@ -282,14 +282,25 @@ variables.
 ### RadSec (RADIUS over TLS)
 
 For a RadSec peer (RFC 6614) — a proxy, or another RADIUS server forwarding
-requests to this one — instead of a plain UDP NAS. Independent of the
-per-site NAS clients above; enable it with:
+requests to this one — instead of a plain UDP NAS. Enable it with:
 
 ```
 RADSEC_ENABLED=true
 RADSEC_PORT=2083
-RADSEC_CLIENT_CIDR=10.0.0.5,10.0.0.6   # comma-separated IP/CIDR of allowed peers
 ```
+
+**A RadSec peer must belong to one of your sites** — set
+`RADSEC_CLIENT_CIDR_<SITE>` (comma-separated IP/CIDR, same site names as
+`NAS_CIDR_<SITE>`) on whichever site it belongs to, e.g.
+`RADSEC_CLIENT_CIDR_BOSTON=10.0.0.5`. A RadSec connection is matched to a
+`client{}` block the same as any plain NAS client, and that block's
+`shortname` is what selects a site's VLAN/tier logic in post-auth — without
+tying it to a site, a RadSec-arriving request wouldn't match any site's case
+in that switch and would always reject, regardless of its actual compliance
+tier. (This was a real bug caught against a real production request: the
+device was correctly evaluated as compliant by `check-policy.sh`, but still
+rejected because `Client-Shortname` resolved to a generic RadSec client name
+that matched no site.)
 
 It reuses the same server cert/key/CA already set up for EAP-TLS
 (`certs/radius-server.key`, `-chain.pem`, `ca-chain.pem`) — RadSec's TLS is
