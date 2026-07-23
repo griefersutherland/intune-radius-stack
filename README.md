@@ -121,6 +121,12 @@ This is Intune's strong-certificate-mapping SID variable for hybrid-joined
 devices - it resolves to nothing (and the URI is simply absent from the
 issued cert) for devices with no on-prem AD counterpart.
 
+The helper also supports an independent device-blocking denylist
+(`ADMIN_API_KEY`, see `.env.example`) for cutting off a stolen/terminated
+device immediately, ahead of any compliance check - see
+intune-radius-helper's README "Device blocking" section for the
+`/block-device`/`/unblock-device`/`/blocked-devices` API.
+
 ### 4. Requesting a one-off client cert manually (no Intune)
 
 For testing, or non-Intune clients, mint one directly the same way as the
