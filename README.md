@@ -308,22 +308,46 @@ just the server proving its identity for RADIUS transport, the same claim
 EAP-TLS already makes, so there's no separate cert to provision.
 
 **This is mutual TLS, not optional.** The peer must present a client cert
-signed by the same CA as your other client certs (see "Requesting a one-off
-client cert manually" above to mint one) — verified against a real
-container: a cert from a different/self-signed CA, or no client cert at all,
-both get rejected at the TLS handshake itself (`unknown CA` / `handshake
-failure` in the log), before any RADIUS packet is processed. There is no
-shared-secret-only mode; the `secret = radsec` FreeRADIUS generates
+signed by the same CA as your other client certs — a cert from a
+different/self-signed CA, or no client cert at all, both get rejected at the
+TLS handshake itself (`unknown CA` / `handshake failure` in the log), before
+any RADIUS packet is processed (confirmed against a real container). There
+is no shared-secret-only mode; the `secret = radsec` FreeRADIUS generates
 internally for these clients is [RFC 6614's own
 convention](https://www.rfc-editor.org/rfc/rfc6614) for TLS-only clients
 (kept only for the RADIUS packet format's sake) — the actual security is the
 mutual TLS handshake, not that value.
 
+#### Minting a peer cert
+
+Same PKI, same process as "Requesting a one-off client cert manually"
+above, minus the SAN URI (that's only for EAP-TLS device identity — a
+RadSec peer isn't identified by cert content, only by which site's
+`RADSEC_CLIENT_CIDR_<SITE>` its source IP falls into):
+
+```bash
+step certificate create "radsec-peer" radsec-peer.crt radsec-peer.key \
+  --profile leaf --kty RSA --size 2048 \
+  --ca ./info/intermediate_ca.crt --ca-key ./info/intermediate_ca.key \
+  --ca-password-file ./info/intermediate_ca.txt \
+  --not-after 8760h --no-password --insecure
+```
+
+Give each physical peer/AP its own cert rather than reusing one across
+multiple sites — FreeRADIUS itself doesn't require this (it only checks the
+cert chains to `ca_file`, not which specific cert was presented), but it
+means you can revoke one site's peer later without touching any other
+site's.
+
 **Not compatible with `FREERADIUS_DEBUG=true`.** TLS sockets require
 threading, which FreeRADIUS's `-X` debug mode disables — confirmed against a
 real container (`Threading must be enabled for TLS sockets to function
 properly`). The container refuses to start with a clear error if you have
-both set, rather than silently starting without the RadSec listener.
+both set, rather than silently starting without the RadSec listener. Use
+`FREERADIUS_DEBUG=verbose` instead (`freeradius -fxx -l stdout`) for
+per-request debug detail while RadSec is enabled — this is what actually
+surfaced the `Client-Shortname` bug above; the normal non-debug log never
+shows individual `Access-Request`/`Access-Accept` packets at all.
 
 To test a peer connection without a full RadSec client, confirm the mutual
 TLS handshake directly:
@@ -335,6 +359,38 @@ openssl s_client -connect <server>:2083 -cert peer.crt -key peer.key -CAfile ca-
 # should fail at the TLS layer (no cert presented)
 openssl s_client -connect <server>:2083 -CAfile ca-chain.pem
 ```
+
+Run this from another machine, not the server itself — connecting to a
+published Docker port via `localhost`/the server's own IP can get NAT'd
+through Docker's bridge gateway rather than your real source IP, which will
+show up as an `unknown client` rejection in the log that has nothing to do
+with your actual RadSec config (confirmed the hard way).
+
+#### NAS-side example: UniFi
+
+UniFi's Network Controller has native RadSec support in its RADIUS profile
+(newer controller versions — under whatever WiFi network / RADIUS profile
+config exposes a **TLS** option):
+
+- **TLS**: checked
+- **Client Certificate**: your peer cert (`radsec-peer.crt`)
+- **Private Key**: your peer key (`radsec-peer.key`)
+- **Private Key Password**: blank (matches `--no-password` above)
+- **CA Certificate**: `root_ca.crt` — sufficient on its own since
+  `radius-server-chain.pem` already includes the full chain (server +
+  intermediate), so the peer only needs to trust the root
+- **Server IP / Port**: your server's IP, port **`2083`** (not `1812` — easy
+  to miss if you're editing an existing plain-RADIUS server entry to add
+  TLS to it)
+- **Shared Secret**: literally `radsec` (see the RFC 6614 note above)
+- **Accounting Servers**: same IP and **same port `2083`** as the auth
+  server, not a separate accounting port — the RadSec listener handles both
+  Access-Request and Accounting-Request over the one TLS connection
+  (`type = auth+acct`), unlike the plain UDP 1812/1813 split
+
+Other RadSec-capable NAS/proxy software should expose the same concepts
+(client cert + key, CA cert, port, and the `radsec` secret convention) even
+if the exact field names differ.
 
 ## Updating
 
