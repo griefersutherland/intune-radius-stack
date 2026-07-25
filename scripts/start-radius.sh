@@ -75,6 +75,39 @@ if is_true "$RADSEC_ENABLED"; then
   fi
 fi
 
+# Guest Wi-Fi via EAP-TTLS/PAP, validated by an LDAP bind-as-user against AD
+# - deliberately NOT routed through intune-radius-helper at all, since guests
+# have no cert and no Entra device identity for it to check. Confirmed
+# against a real container (OpenLDAP standing in for AD): a bind succeeds
+# only with the correct password AND only for members of PAP_LDAP_GROUP_DN -
+# wrong password or non-member both reject, group membership is re-checked
+# on every request (not cached), so removing someone from the group cuts
+# them off on their next auth attempt.
+#
+# PAP is deliberately never MSCHAPv2 here - rlm_ldap's own docs are explicit
+# that bind-as-user against AD ONLY works with a plaintext password (PAP or
+# TTLS/PAP), never MS-CHAP, because AD will not hand back a user's password
+# verifier for FreeRADIUS to compare against directly.
+PAP_ENABLED="${PAP_ENABLED:-false}"
+PAP_LDAP_SERVER="${PAP_LDAP_SERVER:-}"
+PAP_LDAP_PORT="${PAP_LDAP_PORT:-636}"
+PAP_LDAP_USE_SSL="${PAP_LDAP_USE_SSL:-true}"
+PAP_LDAP_VERIFY_CERT="${PAP_LDAP_VERIFY_CERT:-true}"
+PAP_LDAP_BASE_DN="${PAP_LDAP_BASE_DN:-}"
+PAP_LDAP_BIND_USERNAME="${PAP_LDAP_BIND_USERNAME:-}"
+PAP_LDAP_BIND_PASSWORD="${PAP_LDAP_BIND_PASSWORD:-}"
+PAP_LDAP_GROUP_DN="${PAP_LDAP_GROUP_DN:-}"
+
+if is_true "$PAP_ENABLED"; then
+  for _pap_var_name in PAP_LDAP_SERVER PAP_LDAP_BASE_DN PAP_LDAP_BIND_USERNAME PAP_LDAP_BIND_PASSWORD PAP_LDAP_GROUP_DN; do
+    eval "_pap_var_value=\"\${${_pap_var_name}}\""
+    if [ -z "$_pap_var_value" ]; then
+      echo "ERROR: ${_pap_var_name} is required when PAP_ENABLED=true"
+      exit 1
+    fi
+  done
+fi
+
 validate_vlan_tag() {
   # $1 = env var name (for error messages), $2 = tag value
   case "$2" in
@@ -156,6 +189,12 @@ SITE_SWITCH_CASES=""
 RADSEC_CLIENTS_BLOCK=""
 RADSEC_ANY_SITE=0
 
+# Built up per-site below, wrapped in a switch on Client-Shortname the same
+# way as SITE_SWITCH_CASES, but selected instead of it (not combined with
+# it) for EAP-TTLS/PAP guest requests - see the post-auth EAP-Type branch
+# further down.
+PAP_SWITCH_CASES=""
+
 for SITE in $SITES; do
   eval "SITE_NAS_CIDR=\"\${NAS_CIDR_${SITE}}\""
   eval "SITE_NAS_SECRET=\"\${NAS_SECRET_${SITE}:-}\""
@@ -164,6 +203,7 @@ for SITE in $SITES; do
   eval "SITE_VLAN_UNTRUST_WIFI=\"\${VLAN_UNTRUST_WIFI_${SITE}:-}\""
   eval "SITE_VLAN_UNTRUST_WIRED=\"\${VLAN_UNTRUST_WIRED_${SITE}:-}\""
   eval "SITE_RADSEC_CIDR=\"\${RADSEC_CLIENT_CIDR_${SITE}:-}\""
+  eval "SITE_VLAN_PAP_WIFI=\"\${VLAN_PAP_WIFI_${SITE}:-}\""
 
   if [ -z "$SITE_NAS_SECRET" ]; then
     echo "ERROR: NAS_SECRET_${SITE} is required (site ${SITE} defines NAS_CIDR_${SITE} but no secret)"
@@ -174,11 +214,39 @@ for SITE in $SITES; do
   [ -z "$SITE_VLAN_ACCESS_WIRED" ] || validate_vlan_tag "VLAN_ACCESS_WIRED_${SITE}" "$SITE_VLAN_ACCESS_WIRED"
   [ -z "$SITE_VLAN_UNTRUST_WIFI" ] || validate_vlan_tag "VLAN_UNTRUST_WIFI_${SITE}" "$SITE_VLAN_UNTRUST_WIFI"
   [ -z "$SITE_VLAN_UNTRUST_WIRED" ] || validate_vlan_tag "VLAN_UNTRUST_WIRED_${SITE}" "$SITE_VLAN_UNTRUST_WIRED"
+  [ -z "$SITE_VLAN_PAP_WIFI" ] || validate_vlan_tag "VLAN_PAP_WIFI_${SITE}" "$SITE_VLAN_PAP_WIFI"
 
   if [ -n "$SITE_RADSEC_CIDR" ] && ! is_true "$RADSEC_ENABLED"; then
     echo "ERROR: RADSEC_CLIENT_CIDR_${SITE} is set but RADSEC_ENABLED is not true - set RADSEC_ENABLED=true to use RadSec for this site"
     exit 1
   fi
+
+  if [ -n "$SITE_VLAN_PAP_WIFI" ] && ! is_true "$PAP_ENABLED"; then
+    echo "ERROR: VLAN_PAP_WIFI_${SITE} is set but PAP_ENABLED is not true - set PAP_ENABLED=true to use guest PAP for this site"
+    exit 1
+  fi
+
+  # No medium branch here (unlike ACCESS_BRANCHES/UNTRUST_BRANCHES) - guest
+  # PAP is Wi-Fi only by construction (there is no VLAN_PAP_WIRED_<SITE>), so
+  # a site either has a guest VLAN or it doesn't. A site with PAP_ENABLED but
+  # no VLAN_PAP_WIFI_<SITE> rejects guest requests - same fail-closed
+  # reasoning as the untrust tier: an unspecified network isn't an
+  # acceptable place to leave an unmanaged guest device.
+  PAP_SWITCH_CASES="${PAP_SWITCH_CASES}
+            case \"${SITE}\" {"
+  if [ -n "$SITE_VLAN_PAP_WIFI" ]; then
+    PAP_SWITCH_CASES="${PAP_SWITCH_CASES}
+                update reply {
+                    Tunnel-Type = VLAN
+                    Tunnel-Medium-Type = IEEE-802
+                    Tunnel-Private-Group-Id = \"${SITE_VLAN_PAP_WIFI}\"
+                }"
+  else
+    PAP_SWITCH_CASES="${PAP_SWITCH_CASES}
+                reject"
+  fi
+  PAP_SWITCH_CASES="${PAP_SWITCH_CASES}
+            }"
 
   i=1
   OLD_IFS="$IFS"
@@ -358,6 +426,146 @@ else
         check_crl = no'
 fi
 
+# Guest PAP (see the PAP_ENABLED comment above) reuses the same server
+# cert/key/CA as EAP-TLS - it's the same server-identity claim - but needs
+# its own tls-config, since it must NOT require a client cert (that's the
+# whole point: guests have none), unlike the EAP-TLS tls-common above.
+TTLS_BLOCK=""
+if is_true "$PAP_ENABLED"; then
+  TTLS_BLOCK="
+    tls-config ttls-tls-common {
+        private_key_password =
+        private_key_file = /etc/freeradius/certs/radius-server.key
+        certificate_file = /etc/freeradius/certs/radius-server-chain.pem
+        ca_file = /etc/freeradius/certs/ca-chain.pem
+
+        random_file = /dev/urandom
+
+        fragment_size = 1024
+        include_length = yes
+        auto_chain = no
+
+        tls_min_version = \"1.2\"
+        tls_max_version = \"1.3\"
+
+        require_client_cert = no
+    }
+
+    ttls {
+        tls = ttls-tls-common
+        default_eap_type = md5
+        virtual_server = \"inner-tunnel\"
+    }"
+
+  PAP_LDAP_SCHEME="ldap"
+  is_true "$PAP_LDAP_USE_SSL" && PAP_LDAP_SCHEME="ldaps"
+
+  if is_true "$PAP_LDAP_VERIFY_CERT"; then
+    PAP_LDAP_REQUIRE_CERT="demand"
+  else
+    PAP_LDAP_REQUIRE_CERT="allow"
+  fi
+
+  cat > /etc/freeradius/mods-enabled/ldap <<LDAP_EOF
+ldap {
+    server = '${PAP_LDAP_SCHEME}://${PAP_LDAP_SERVER}:${PAP_LDAP_PORT}'
+    identity = '${PAP_LDAP_BIND_USERNAME}'
+    password = ${PAP_LDAP_BIND_PASSWORD}
+    base_dn = '${PAP_LDAP_BASE_DN}'
+
+    tls {
+        require_cert = '${PAP_LDAP_REQUIRE_CERT}'
+    }
+
+    user {
+        base_dn = "\${..base_dn}"
+        filter = "(sAMAccountName=%{%{Stripped-User-Name}:-%{User-Name}})"
+    }
+
+    group {
+        base_dn = "\${..base_dn}"
+        filter = '(objectClass=group)'
+        membership_attribute = 'memberOf'
+    }
+}
+LDAP_EOF
+
+  # Bind-as-user pattern rlm_ldap's own docs specify for AD/PAP (see the
+  # PAP_ENABLED comment above) - confirmed against a real container (LDAP
+  # bind succeeds only with the correct password, group check re-evaluated
+  # on every request). Trimmed from FreeRADIUS's stock inner-tunnel template
+  # (still includes chap/mschap/eap passthrough for parity, even though this
+  # stack only actually wires up PAP).
+  cat > /etc/freeradius/sites-enabled/inner-tunnel <<INNER_TUNNEL_EOF
+server inner-tunnel {
+
+listen {
+       ipaddr = 127.0.0.1
+       port = 18120
+       type = auth
+}
+
+authorize {
+    filter_username
+    chap
+    mschap
+    suffix
+    update control {
+        &Proxy-To-Realm := LOCAL
+    }
+    eap {
+        ok = return
+    }
+    files
+    -sql
+    ldap
+    expiration
+    logintime
+    pap
+
+    if (!&control:Auth-Type && &User-Password) {
+        update control {
+            &Auth-Type := LDAP
+        }
+    }
+
+    if (&control:Auth-Type == LDAP) {
+        if (!(LDAP-Group == "${PAP_LDAP_GROUP_DN}")) {
+            reject
+        }
+    }
+}
+
+authenticate {
+    Auth-Type PAP {
+        pap
+    }
+    Auth-Type CHAP {
+        chap
+    }
+    Auth-Type MS-CHAP {
+        mschap
+    }
+    mschap
+    Auth-Type LDAP {
+        ldap
+    }
+    eap
+}
+
+session {
+}
+
+post-auth {
+    -sql
+    Post-Auth-Type REJECT {
+        attr_filter.access_reject
+    }
+}
+}
+INNER_TUNNEL_EOF
+fi
+
 cat > /etc/freeradius/mods-enabled/eap <<EAP_EOF
 eap {
     default_eap_type = tls
@@ -393,6 +601,7 @@ ${CRL_BLOCK}
     tls {
         tls = tls-common
     }
+${TTLS_BLOCK}
 }
 EAP_EOF
 
@@ -409,14 +618,28 @@ EAP_EOF
 # matching site+medium rejects instead of leaving an untrusted client on an
 # unspecified/default network - untrust existing at all implies you intend
 # to contain it somewhere specific.
+#
+# A request that authenticated via EAP-TTLS (guest PAP) branches off before
+# any of that - no cert, no Entra device identity, so check-policy.sh/the
+# helper is never called for it at all. It goes straight to PAP_SWITCH_CASES
+# instead, which only ever assigns the site's guest VLAN or rejects.
 POST_AUTH_BLOCK="
     post-auth {
-        update control {
-            Tmp-String-0 := \"%{exec:/usr/local/bin/check-policy.sh %{Calling-Station-Id} %{User-Name}}\"
+        if (&EAP-Type == TTLS) {
+            switch \"%{Client-Shortname}\" {${PAP_SWITCH_CASES}
+                case {
+                    reject
+                }
+            }
         }
-        switch \"%{Client-Shortname}\" {${SITE_SWITCH_CASES}
-            case {
-                reject
+        else {
+            update control {
+                Tmp-String-0 := \"%{exec:/usr/local/bin/check-policy.sh %{Calling-Station-Id} %{User-Name}}\"
+            }
+            switch \"%{Client-Shortname}\" {${SITE_SWITCH_CASES}
+                case {
+                    reject
+                }
             }
         }
     }"
@@ -489,7 +712,8 @@ for SITE in $SITES; do
   eval "SITE_VLAN_UNTRUST_WIFI=\"\${VLAN_UNTRUST_WIFI_${SITE}:-}\""
   eval "SITE_VLAN_UNTRUST_WIRED=\"\${VLAN_UNTRUST_WIRED_${SITE}:-}\""
   eval "SITE_RADSEC_CIDR=\"\${RADSEC_CLIENT_CIDR_${SITE}:-}\""
-  echo "  ${SITE}: nas=${SITE_NAS_CIDR} wifi_access=${SITE_VLAN_ACCESS_WIFI:-none} wired_access=${SITE_VLAN_ACCESS_WIRED:-none} wifi_untrust=${SITE_VLAN_UNTRUST_WIFI:-none} wired_untrust=${SITE_VLAN_UNTRUST_WIRED:-none} radsec_peers=${SITE_RADSEC_CIDR:-none}"
+  eval "SITE_VLAN_PAP_WIFI=\"\${VLAN_PAP_WIFI_${SITE}:-}\""
+  echo "  ${SITE}: nas=${SITE_NAS_CIDR} wifi_access=${SITE_VLAN_ACCESS_WIFI:-none} wired_access=${SITE_VLAN_ACCESS_WIRED:-none} wifi_untrust=${SITE_VLAN_UNTRUST_WIFI:-none} wired_untrust=${SITE_VLAN_UNTRUST_WIRED:-none} radsec_peers=${SITE_RADSEC_CIDR:-none} pap_guest_vlan=${SITE_VLAN_PAP_WIFI:-none}"
 done
 
 echo
@@ -497,6 +721,13 @@ if is_true "$RADSEC_ENABLED"; then
   echo "RadSec: enabled on TCP ${RADSEC_PORT}"
 else
   echo "RadSec: disabled"
+fi
+
+echo
+if is_true "$PAP_ENABLED"; then
+  echo "Guest PAP: enabled, LDAP server=${PAP_LDAP_SERVER}:${PAP_LDAP_PORT}, group=${PAP_LDAP_GROUP_DN}"
+else
+  echo "Guest PAP: disabled"
 fi
 
 echo

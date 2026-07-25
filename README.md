@@ -392,6 +392,67 @@ Other RadSec-capable NAS/proxy software should expose the same concepts
 (client cert + key, CA cert, port, and the `radsec` secret convention) even
 if the exact field names differ.
 
+### Guest Wi-Fi (EAP-TTLS/PAP against AD)
+
+For guests authenticating with a username/password instead of a device
+cert - completely separate from everything above. Enable with:
+
+```
+PAP_ENABLED=true
+PAP_LDAP_SERVER=your-dc.example.com
+PAP_LDAP_BASE_DN=OU=users,DC=example,DC=com
+PAP_LDAP_BIND_USERNAME=svc-radius@example.com
+PAP_LDAP_BIND_PASSWORD=...
+PAP_LDAP_GROUP_DN=CN=WifiGuests,OU=Groups,DC=example,DC=com
+
+VLAN_PAP_WIFI_BOSTON=50   # per-site, same pattern as VLAN_ACCESS_WIFI_<SITE>
+```
+
+**Why this is deliberately separate from the rest of this stack:** guests
+have no certificate and no Entra device identity, so there's nothing for
+`intune-radius-helper` to check - a guest request never calls
+`check-policy.sh` or the helper at all. It's routed entirely by EAP type: in
+`post-auth`, `if (&EAP-Type == TTLS)` sends the request straight to a
+per-site guest VLAN (or rejects, if that site has no `VLAN_PAP_WIFI_<SITE>`
+configured), bypassing the Intune/Entra compliance switch entirely.
+
+**Why PAP specifically, not MSCHAPv2:** this is not a preference, it's a
+hard constraint. Validating a password against AD from FreeRADIUS requires
+an LDAP "bind as user" - attempting the bind with the username and password
+exactly as the user supplied them. That only works if FreeRADIUS actually
+has the plaintext password, which only PAP (or EAP-TTLS with a PAP inner
+method) provides - MSCHAPv2 only ever hands FreeRADIUS a challenge-response,
+never the password itself, so there's nothing to bind with. (The
+alternative for MSCHAPv2 against AD is `ntlm_auth`/winbind, which requires
+actually domain-joining the container - real persistent state, an ongoing
+machine-account trust to maintain, and DNS/Kerberos/SMB connectivity to a
+DC. Given this is only for guest Wi-Fi, that's a lot of infrastructure for
+what PAP against AD gets you for free.)
+
+Since the client doesn't present a certificate, this uses **EAP-TTLS**, not
+EAP-TLS - the server still proves its own identity via the same cert already
+used for EAP-TLS/RadSec, but the client only has to trust that cert, not
+present one back. **Platform note:** TTLS is natively supported on macOS,
+iOS, Android, Linux, and ChromeOS - Windows is the one notable gap, with no
+built-in EAP-TTLS support in its native 802.1X stack. If a meaningful
+fraction of your guests are on Windows, factor that in.
+
+**Group-restricted, not open to every AD account.** Only members of
+`PAP_LDAP_GROUP_DN` get through - anyone else with otherwise-valid AD
+credentials is rejected, checked fresh on every request (not cached), so
+removing someone from the group cuts off their access on their next
+connection attempt, not after some cache TTL expires.
+
+**Delegation:** `PAP_LDAP_BIND_USERNAME`/`PAP_LDAP_BIND_PASSWORD` only need
+plain Domain Users membership - enough to bind and search. No elevated,
+delegated, or write permissions of any kind.
+
+Verified against a real container (OpenLDAP standing in for AD): an LDAP
+bind succeeds only with the exact correct password, group membership is
+independently enforced (a correct password for a non-member still rejects),
+and the real generated `sAMAccountName=` search filter executes correctly
+against a live LDAP server.
+
 ## Updating
 
 Pull the latest upstream FreeRADIUS and helper images with:
